@@ -13,7 +13,7 @@
 #include "cuStinger.hpp"
 #include <chrono>
 #include <iomanip>
-
+//testing commit
 using namespace std;
 
 // CUDA error checking macro
