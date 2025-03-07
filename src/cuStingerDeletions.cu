@@ -5,6 +5,7 @@
 #include "update.hpp"
 #include "memoryManager.hpp"
 #include "cuStinger.hpp"
+#include <cuStingerDefs.hpp>
 
 using namespace std;
 
