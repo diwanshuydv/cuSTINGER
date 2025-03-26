@@ -16,7 +16,6 @@
 
 using namespace std;
 
-// CUDA error checking macro
 #define CHECK_CUDA(call) {                                            \
     cudaError_t err = call;                                           \
     if (err != cudaSuccess) {                                         \
@@ -25,14 +24,24 @@ using namespace std;
         exit(EXIT_FAILURE);                                           \
     }                                                                 \
 }
+
 struct Update {
-    bool is_addition; // true if edge is added, false if removed
-    vertexId_t u, v;  // edge between vertices u and v
+    bool is_addition; 
+    vertexId_t u, v;  
 };
 
-//////////////////////////////////////
-// BFS Kernel
-//////////////////////////////////////
+/**
+ * CUDA kernel for BFS traversal
+ * @param numVertices Number of vertices in the graph
+ * @param d_offsets CSR offsets array (device)
+ * @param d_edges CSR edges array (device)
+ * @param d_distances Distance array (device)
+ * @param d_frontier Current frontier vertices (device)
+ * @param frontierSize Size of current frontier
+ * @param d_next_frontier Next frontier vertices (device)
+ * @param d_next_frontier_size Size of next frontier (device)
+ * @param currentLevel Current BFS level
+ */
 __global__ void bfs_kernel(const cuStinger::cusVertexData* dVD,
     const vertexId_t nv,
     const int current_level,
@@ -41,16 +50,17 @@ __global__ void bfs_kernel(const cuStinger::cusVertexData* dVD,
     int* levels,
     vertexId_t* next_frontier,
     int* next_count) {
-  // thread id
+  
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < frontier_size) {
-    int v = frontier[tid];  // current vertex from frontier
+    int v = frontier[tid];  
     int numNeighbors = dVD->used[v];
-    // reinterpret pointer to edge memory
+    
     vertexId_t* nbrArray = reinterpret_cast<vertexId_t*>(dVD->edMem[v]);
     for (int i = 0; i < numNeighbors; i++) {
       vertexId_t nbr = nbrArray[i];
-      // If not yet discovered then set level and add to next frontier.
+      
+      
       if (atomicCAS(&levels[nbr], -1, current_level + 1) == -1) {
         int pos = atomicAdd(next_count, 1);
         next_frontier[pos] = nbr;
@@ -59,55 +69,50 @@ __global__ void bfs_kernel(const cuStinger::cusVertexData* dVD,
   }
 }
 
-//////////////////////////////////////
-// Host-Side BFS Implementation
-//////////////////////////////////////
 int* runBFS(cuStinger* graph, int source ,int* h_levels,int* d_frontier) {
-    // nv = number of vertices
+    
     int nv = graph->nv;
-
-    // array of levels on GPU
+    
     int* d_levels;
 
-    // if CUDA has error -> inform
+    
     CHECK_CUDA(cudaMalloc((void**)&d_levels, nv * sizeof(int)));
 
-    // copy memory from host to device
+    
     CHECK_CUDA(cudaMemcpy(d_levels, h_levels, nv * sizeof(int), cudaMemcpyHostToDevice));
 
-    // next border
     int* d_next_frontier;
-    // CHECK_CUDA(cudaMalloc((void**)&d_frontier, nv * sizeof(vertexId_t)));
+    
     CHECK_CUDA(cudaMalloc((void**)&d_next_frontier, nv * sizeof(vertexId_t)));
 
-    // Start frontier contains only the source vertex
-    // how many elements in CPU queue
+    
+    
     int h_frontier_size = 1;
     CHECK_CUDA(cudaMemcpy(d_frontier, &source, sizeof(int), cudaMemcpyHostToDevice));
 
-    // Allocate device counter for the next frontier
+    
     int* d_next_count;
     CHECK_CUDA(cudaMalloc((void**)&d_next_count, sizeof(int)));
 
     int current_level = 0;
     while (h_frontier_size > 0) {
-        // Reset next frontier count
+        
         CHECK_CUDA(cudaMemset(d_next_count, 0, sizeof(int)));
 
-        // Launch BFS kernel
+        
         int blockSize = 256;
-        // which thread runs where 
+        
         int gridSize = (h_frontier_size + blockSize - 1) / blockSize;
         bfs_kernel<<<gridSize, blockSize>>>(graph->dVD, nv, current_level, d_frontier,
                                             h_frontier_size, d_levels, d_next_frontier, d_next_count);
-        // cout<<"BFS KERNEL LAUNCHED"<<endl;
+        
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        // Copy next frontier size back to host
+        
         int h_next_count;
         CHECK_CUDA(cudaMemcpy(&h_next_count, d_next_count, sizeof(int), cudaMemcpyDeviceToHost));
 
-        // Swap frontiers
+        
         int* temp = d_frontier;
         d_frontier = d_next_frontier;
         d_next_frontier = temp;
@@ -115,17 +120,16 @@ int* runBFS(cuStinger* graph, int source ,int* h_levels,int* d_frontier) {
         h_frontier_size = h_next_count;
         current_level++;
     }
-
-    // Copy levels array back to host
+    
     CHECK_CUDA(cudaMemcpy(h_levels, d_levels, nv * sizeof(int), cudaMemcpyDeviceToHost));
 
-    // Print BFS levels
+    
     for (int i = 0; i < nv; i++) {
         printf("Vertex %d: Level %d\n", i, h_levels[i]);
     }
 
-    // Free allocated memory
-    // free(h_levels);
+    
+    
     CHECK_CUDA(cudaFree(d_levels));
     CHECK_CUDA(cudaFree(d_frontier));
     CHECK_CUDA(cudaFree(d_next_frontier));
@@ -133,57 +137,44 @@ int* runBFS(cuStinger* graph, int source ,int* h_levels,int* d_frontier) {
     return h_levels;
 }
 
-
-//////////////////////////////////////
-// BFS Update Kernel for Edge Additions
-//////////////////////////////////////
-// For each new edge (u,v), if u is discovered and can provide a shorter
-// path to v, update v's level and add it to the update frontier.
 __global__ void bfs_update_add_kernel(const cuStinger::cusVertexData* dVD,  
-    const int* add_edges,   // packed as: [u0, v0, u1, v1, ...]  
+    const int* add_edges,   
     const int num_edges,  
     int* levels,  
     vertexId_t* update_frontier,  
     int* update_count) {  
   int tid = blockIdx.x * blockDim.x + threadIdx.x; 
   if (tid < num_edges) {  
-  printf("tid: %d\n", tid); 
-
     int u = add_edges[2 * tid];  
     int v = add_edges[2 * tid + 1];  
-    // Process only if u is discovered.
-    printf("u: %d, v: %d\n", u, v);
-    printf("fine");
-    printf("levels[u]: %d\n", levels[u]);
+    
     if (levels[u] != -1) {  
       int new_level = levels[u] + 1;  
-      // Use atomicCAS to update levels[v] only if it is still undiscovered (-1)
+      
       int old = atomicCAS(&levels[v], -1, new_level);  
-      printf("old: %d\n", old);
+      
       
       int old_2 = atomicMin(&levels[v], new_level);
       
 
-      if (old == -1 || old_2>new_level) {  // Successful update: v was undiscovered  
-        printf("update_count: %d\n", *(update_count));
+      if (old == -1 || old_2>new_level) {  
+        
         int pos = atomicAdd(update_count, 1);  
-        printf("update_count: %d\n", *(update_count));
-        printf("pos: %d\n", pos);   
+        
+        
         update_frontier[pos] = v;  
-        printf("-------- chutiya code ------------ update_frontier[pos]: %d\n", update_frontier[pos]);
       }  
     }  
   }  
 }
 
-//////////////////////////////////////
-// BFS Update Kernel for Edge Deletions
-//////////////////////////////////////
-// For each deleted edge (u,v), if v's current level comes from u then
-// mark v for recomputation by setting its level to INT_MAX (as infinity)
-// and adding it to the update frontier.
+
+
+
+
+
 __global__ void bfs_update_del_kernel(const cuStinger::cusVertexData* dVD,
-    const int* del_edges,   // packed as: [u0, v0, u1, v1, ...]
+    const int* del_edges,   
     const int num_edges,
     int* levels,
     vertexId_t* update_frontier,
@@ -193,25 +184,23 @@ __global__ void bfs_update_del_kernel(const cuStinger::cusVertexData* dVD,
   if (tid < num_edges) {
     int u = del_edges[2 * tid];
     int v = del_edges[2 * tid + 1];
-    // Only process if (u,v) was used in the BFS tree:
-    // u must have been reached and v’s level must be exactly levels[u] + 1.
+    
+    
     if (levels[u] == -1 || levels[v] != levels[u] + 1)
       return;
       
-    // Mark v for recomputation: use atomicExch so that only one thread marks v.
-    int old_level = atomicExch(&levels[v], INT_MAX);
-    // If v was not already marked, add it to the update frontier.
-    if(old_level != INT_MAX) {
+    
+    
+    int old_level = atomicExch(&levels[v], -1);
+    
+    if(old_level != -1) {
       int pos = atomicAdd(update_count, 1);
       update_frontier[pos] = v;
+      
     }
   }
 }
 
-//////////////////////////////////////
-// Kernel to Invalidate Neighbor Levels
-//////////////////////////////////////
-// Marks neighbors of the invalidated nodes for recomputation.
 __global__ void bfs_invalidate_levels_kernel(const cuStinger::cusVertexData* dVD,
     const int frontier_size,
     const vertexId_t* frontier,
@@ -219,12 +208,12 @@ __global__ void bfs_invalidate_levels_kernel(const cuStinger::cusVertexData* dVD
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < frontier_size) {
     int v = frontier[tid];
-    if (levels[v] == -1) {  // Process only invalidated nodes
+    if (levels[v] == -1) {  
       int numNeighbors = dVD->used[v];
       vertexId_t* nbrArray = reinterpret_cast<vertexId_t*>(dVD->edMem[v]);
       for (int i = 0; i < numNeighbors; i++) {
         int nbr = nbrArray[i];
-        if (levels[nbr] > levels[v]) {  // Mark higher-level nodes for recomputation
+        if (levels[nbr] > levels[v]) {  
           levels[nbr] = -1;
         }
       }
@@ -232,15 +221,6 @@ __global__ void bfs_invalidate_levels_kernel(const cuStinger::cusVertexData* dVD
   }
 }
 
-//////////////////////////////////////
-// BFS Recompute Kernel for Propagation
-//////////////////////////////////////
-// This kernel is launched on the update frontier. For each vertex v in the
-// frontier (which was marked with INT_MAX), it computes a new level by scanning
-// all its neighbors and taking the minimum (levels[nbr] + 1). If a valid candidate
-// is found, the new level is set (or -1 if no valid neighbor exists). Additionally,
-// if v’s level changes, v’s children may need to update their levels so they are
-// added to the next frontier.
 __global__ void bfs_recompute_kernel(const cuStinger::cusVertexData* dVD,
     const int nv,
     const int* frontier,
@@ -252,13 +232,11 @@ __global__ void bfs_recompute_kernel(const cuStinger::cusVertexData* dVD,
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < frontier_size) {
     int v = frontier[tid];
-    // Recompute the new level for v.
+    
     int candidate = INT_MAX;
     int numNeighbors = dVD->used[v];
     vertexId_t* nbrArray = reinterpret_cast<vertexId_t*>(dVD->edMem[v]);
     
-    // For each neighbor, consider candidate level = levels[nbr] + 1.
-    // Only consider neighbors with a valid (non-INT_MAX, non -1) level.
     for (int i = 0; i < numNeighbors; i++) {
       int nbr = nbrArray[i];
       int nbr_level = levels[nbr];
@@ -267,22 +245,18 @@ __global__ void bfs_recompute_kernel(const cuStinger::cusVertexData* dVD,
       }
     }
     
-    // If no valid candidate was found, v remains unreachable.
     int new_level = (candidate == INT_MAX) ? -1 : candidate;
     
-    // Update v’s level if it differs from the (marked) value.
-    // Note: v was marked as INT_MAX, so we expect new_level != INT_MAX.
+    
+    
     int old_level = INT_MAX;
     old_level = atomicExch(&levels[v], new_level);
-    
-    // If v's level changed (i.e. new_level is different from the old tree level),
-    // then v's neighbors (which might be using v as a parent) could be affected.
-    // We add v’s neighbors to the next frontier if they can improve their level.
+
     if (new_level != old_level) {
       for (int i = 0; i < numNeighbors; i++) {
         int nbr = nbrArray[i];
-        // If neighbor has a valid level and its current level is greater than new_level + 1,
-        // try to update it.
+        
+        
         if (levels[nbr] != -1 && levels[nbr] > new_level + 1) {
           int prev = atomicMin(&levels[nbr], new_level + 1);
           if (prev > new_level + 1) {
@@ -294,36 +268,31 @@ __global__ void bfs_recompute_kernel(const cuStinger::cusVertexData* dVD,
     }
   }
 }
-//////////////////////////////////////
-// BFS Kernel to handke updates
-//////////////////////////////////////
+
 __global__ void bfs_kernel_update(const cuStinger::cusVertexData* dVD,
     const vertexId_t nv,
-    // int current_level,
+    
     const int* frontier,
     const int frontier_size,
     int* levels,
     vertexId_t* next_frontier,
-    int* next_count) {
-  // thread id
+    int* next_count
+  ) {
+  
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < frontier_size) {
-    int v = frontier[tid];  // current vertex from frontier
-    printf("----tid---: %d\n", tid);
-    printf("---v---: %d\n", v);
-    int numNeighbors = dVD->used[v];
-    printf("----numNeighbors---: %d\n", numNeighbors);
-    // reinterpret pointer to edge memory
+    int v = frontier[tid];  
+    int numNeighbors = dVD->used[v];    
     vertexId_t* nbrArray = reinterpret_cast<vertexId_t*>(dVD->edMem[v]);
     for (int i = 0; i < numNeighbors; i++) {
       vertexId_t nbr = nbrArray[i];
-      printf("----nbr---: %d\n", nbr);
+      
       int current_level = levels[v];
-      printf("----current_level_: %d\n", current_level);
-      // If not yet discovered then set level and add to next frontier.
+      
+      
       int old = atomicMin(&levels[nbr], current_level + 1);
       if (old == -1 || old > current_level + 1) {
-        printf("Sauda chala\n");
+        
         int pos = atomicAdd(next_count, 1);
         next_frontier[pos] = nbr;
       }
@@ -331,16 +300,139 @@ __global__ void bfs_kernel_update(const cuStinger::cusVertexData* dVD,
   }
 }
 
-//////////////////////////////////////
-// Host-Side Streaming Update Handler
-//////////////////////////////////////
-// This function applies a batch of update edges (additions or deletions)
-// and then “propagates” the changes via BFS until no further level changes occur.
+__global__ void bfs_kernel_connected(const cuStinger::cusVertexData* dVD,
+  const vertexId_t nv,
+  const int current_level,
+  const int* frontier,
+  const int frontier_size,
+  int* levels,
+  vertexId_t* next_frontier,
+  int* next_count,
+  const vertexId_t target_node,
+  int* target_reached) {
+
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+if (tid < frontier_size) {
+  int v = frontier[tid];  
+  int numNeighbors = dVD->used[v];
+  vertexId_t* nbrArray = reinterpret_cast<vertexId_t*>(dVD->edMem[v]);
+  for (int i = 0; i < numNeighbors; i++) {
+    vertexId_t nbr = nbrArray[i];    
+    if (nbr == target_node) {
+      atomicAdd(target_reached, 1); 
+      return;
+    }
+    
+    if (atomicExch(&levels[nbr], current_level) == -1) {
+      int pos = atomicAdd(next_count, 1);
+      next_frontier[pos] = nbr;
+    }
+  }
+}
+}
+
+__global__ void bfs_kernel_bt_src_v(const cuStinger::cusVertexData* dVD,
+  const vertexId_t nv,
+  const int current_level,
+  const int* frontier,
+  const int frontier_size,
+  int* levels,
+  vertexId_t* next_frontier,
+  int* next_count,
+int* v,
+int* found,
+int* len_v) {
+
+int tid = blockIdx.x * blockDim.x + threadIdx.x;
+if (tid < frontier_size && found<len_v) {
+  int v = frontier[tid];  
+  int numNeighbors = dVD->used[v];
+  
+  vertexId_t* nbrArray = reinterpret_cast<vertexId_t*>(dVD->edMem[v]);
+  for (int i = 0; i < numNeighbors; i++) {
+    vertexId_t nbr = nbrArray[i];
+    if (nbr == v) {
+      atomicAdd(found, 1); 
+      return;
+    }
+    
+    
+    if (atomicCAS(&levels[nbr], -1, current_level + 1) == -1) {
+      int pos = atomicAdd(next_count, 1);
+      next_frontier[pos] = nbr;
+    }
+  }
+}
+}
+
+int* runBFS_bt_src_v(cuStinger* graph, int source ,int* h_levels,int* d_frontier,int* v, int* len_v) {  
+  int nv = graph->nv;
+  int* d_levels;
+  CHECK_CUDA(cudaMalloc((void**)&d_levels, nv * sizeof(int)));
+  CHECK_CUDA(cudaMemcpy(d_levels, h_levels, nv * sizeof(int), cudaMemcpyHostToDevice));
+  int* d_next_frontier;
+  CHECK_CUDA(cudaMalloc((void**)&d_next_frontier, nv * sizeof(vertexId_t)));
+  int h_frontier_size = 1;
+  CHECK_CUDA(cudaMemcpy(d_frontier, &source, sizeof(int), cudaMemcpyHostToDevice));
+  int* d_next_count;
+  CHECK_CUDA(cudaMalloc((void**)&d_next_count, sizeof(int)));
+  int* v_d;
+  CHECK_CUDA(cudaMalloc((void**)&v_d, sizeof(int)));
+  CHECK_CUDA(cudaMemcpy(v_d,v, sizeof(int),cudaMemcpyHostToDevice));
+  int* found;
+  CHECK_CUDA(cudaMalloc((void**)&found, sizeof(int)));
+  int* len_v_d;
+  CHECK_CUDA(cudaMalloc((void**)&len_v_d, nv*sizeof(int)));
+  CHECK_CUDA(cudaMemcpy(len_v_d,len_v,nv*sizeof(int),cudaMemcpyHostToDevice));
+  int current_level = 0;
+  while (h_frontier_size > 0) {
+      
+      CHECK_CUDA(cudaMemset(d_next_count, 0, sizeof(int)));
+
+      
+      int blockSize = 256;
+      
+      int gridSize = (h_frontier_size + blockSize - 1) / blockSize;
+      bfs_kernel_bt_src_v<<<gridSize, blockSize>>>(graph->dVD, nv, current_level, d_frontier,
+                                          h_frontier_size, d_levels, d_next_frontier, d_next_count, v_d, found,len_v_d);
+      
+      CHECK_CUDA(cudaDeviceSynchronize());
+
+      
+      int h_next_count;
+      CHECK_CUDA(cudaMemcpy(&h_next_count, d_next_count, sizeof(int), cudaMemcpyDeviceToHost));
+
+      
+      int* temp = d_frontier;
+      d_frontier = d_next_frontier;
+      d_next_frontier = temp;
+
+      h_frontier_size = h_next_count;
+      current_level++;
+  }
+
+  
+  CHECK_CUDA(cudaMemcpy(h_levels, d_levels, nv * sizeof(int), cudaMemcpyDeviceToHost));
+
+  
+  for (int i = 0; i < nv; i++) {
+      printf("Vertex %d: Level %d\n", i, h_levels[i]);
+  }
+
+  
+  
+  CHECK_CUDA(cudaFree(d_levels));
+  CHECK_CUDA(cudaFree(d_frontier));
+  CHECK_CUDA(cudaFree(d_next_frontier));
+  CHECK_CUDA(cudaFree(d_next_count));
+  return h_levels;
+}
+
 void updateBFSUpdates(cuStinger* graph, int* h_levels, int* d_frontier,
-                      int* h_update_edges, int num_updates, bool isAddition) {
+                      int* h_update_edges, int num_updates, bool isAddition, int source) {
   int nv = graph->nv;
 
-  // Copy update edges to device memory.
+  
   int* d_update_edges;
   CHECK_CUDA(cudaMalloc((void**)&d_update_edges, 2 * num_updates * sizeof(int)));
   CHECK_CUDA(cudaMemcpy(d_update_edges, h_update_edges,
@@ -352,7 +444,7 @@ void updateBFSUpdates(cuStinger* graph, int* h_levels, int* d_frontier,
   CHECK_CUDA(cudaMemcpy(d_levels, h_levels,
                         nv * sizeof(int), cudaMemcpyHostToDevice));
 
-  // Allocate temporary frontier and counter for propagating update changes.
+  
   vertexId_t* d_update_frontier;
   vertexId_t* d_next_frontier;
 
@@ -367,88 +459,91 @@ void updateBFSUpdates(cuStinger* graph, int* h_levels, int* d_frontier,
   int blockSize = 256;
   int gridSize = (num_updates + blockSize - 1) / blockSize;
 
-  // Launch the appropriate update kernel.
+  
   if (isAddition) {
     bfs_update_add_kernel<<<gridSize, blockSize>>>(graph->dVD, d_update_edges, num_updates,
                                                      d_levels, d_update_frontier, d_update_count);
 
-      // Get the count of vertices in the update frontier.
+      
     CHECK_CUDA(cudaMemcpy(&h_update_count, d_update_count, sizeof(int), cudaMemcpyDeviceToHost));
+    
+    
 
-  // Propagate the update changes until the frontier is empty.
-    // int current_level = 0;  // You might want to adjust this if levels are relative to a root.
-    printf("h_update_count: %d\n", h_update_count);
+  
+    
+    
     while (h_update_count > 0) {
 
-        // Reset the counter for the next propagation step.
+        
         CHECK_CUDA(cudaMemset(d_update_count, 0, sizeof(int)));
         gridSize = (h_update_count + blockSize - 1) / blockSize;
-        // Use the original BFS kernel to propagate updated levels.
+        
         bfs_kernel_update<<<gridSize, blockSize>>>(graph->dVD, nv, d_update_frontier,
                                             h_update_count, d_levels, d_next_frontier, d_update_count);
         CHECK_CUDA(cudaDeviceSynchronize());
-        // Swap frontiers.
+        
         vertexId_t* temp;
         CHECK_CUDA(cudaMalloc((void**)&temp, nv * sizeof(vertexId_t)));
         d_update_frontier = d_next_frontier;
         d_next_frontier = temp;
-        // Get the new update frontier count.
+        
         CHECK_CUDA(cudaMemcpy(&h_update_count, d_update_count, sizeof(int), cudaMemcpyDeviceToHost));
-        printf("h_update_count: %d\n", h_update_count);
-
-        // current_level++;
-  }                                                 
-   
-  } else {
-    bfs_update_del_kernel<<<gridSize, blockSize>>>(graph->dVD, d_update_edges, num_updates,
-        d_levels, d_update_frontier, d_update_count);
-CHECK_CUDA(cudaDeviceSynchronize());
-CHECK_CUDA(cudaMemcpy(&h_update_count, d_update_count, sizeof(int), cudaMemcpyDeviceToHost));
-
-  // Propagate the update changes until the frontier is empty.
-    // int current_level = 0;  // You might want to adjust this if levels are relative to a root.
-    printf("h_update_count: %d\n", h_update_count);
-    while (h_update_count > 0) {
-
-        // Reset the counter for the next propagation step.
-        CHECK_CUDA(cudaMemset(d_update_count, 0, sizeof(int)));
-        gridSize = (h_update_count + blockSize - 1) / blockSize;
-        // Use the original BFS kernel to propagate updated levels.
-       // For deletions, use the recompute kernel to recalc affected levels.
-      bfs_recompute_kernel<<<gridSize, blockSize>>>(graph->dVD, nv, d_update_frontier,
-        h_update_count, d_levels, d_next_frontier, d_update_count);
-
-        CHECK_CUDA(cudaDeviceSynchronize());
-        // Swap frontiers.
-        vertexId_t* temp;
-        CHECK_CUDA(cudaMalloc((void**)&temp, nv * sizeof(vertexId_t)));
-        d_update_frontier = d_next_frontier;
-        d_next_frontier = temp;
-        // Get the new update frontier count.
-        CHECK_CUDA(cudaMemcpy(&h_update_count, d_update_count, sizeof(int), cudaMemcpyDeviceToHost));
-        printf("h_update_count: %d\n", h_update_count);
-
-        // current_level++;
-  }                       
-}
-  CHECK_CUDA(cudaDeviceSynchronize());
-
-
-   // Copy levels array back to host
+  }      
    CHECK_CUDA(cudaMemcpy(h_levels, d_levels, nv * sizeof(int), cudaMemcpyDeviceToHost));
-   // Print BFS levels
+   
    for (int i = 0; i < nv; i++) {
     printf("Vertex %d: Level %d\n", i, h_levels[i]);
-}
+}                                           
+   
+  } else {
+    printf("reached else condition\n");
+    int del_current_level = 0;
+    int v[num_updates];
+    for (int i=0;i<num_updates;i++) {
+      v[i] = h_update_edges[2*i+1];
+    }
+    int* level =runBFS_bt_src_v(graph, source,h_levels, d_frontier, v, &num_updates);
+    
+    
+    for (int i=0;i<v[num_updates-1];i++) {
+      h_levels[i] = level[i];
+    }
+    h_update_count = num_updates;
+    CHECK_CUDA(cudaDeviceSynchronize());
+    
+    CHECK_CUDA(cudaMemcpy(v, d_update_frontier, nv*sizeof(int), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(h_levels, d_levels, nv * sizeof(int), cudaMemcpyHostToDevice));
+    while (h_update_count > 0) {
 
-  // Free temporary device memory.
+      
+      CHECK_CUDA(cudaMemset(d_update_count, 0, sizeof(int)));
+      gridSize = (h_update_count + blockSize - 1) / blockSize;
+      
+      bfs_kernel_update<<<gridSize, blockSize>>>(graph->dVD, nv, d_update_frontier,
+                                          h_update_count, d_levels, d_next_frontier, d_update_count);
+      CHECK_CUDA(cudaDeviceSynchronize());
+      
+      vertexId_t* temp;
+      CHECK_CUDA(cudaMalloc((void**)&temp, nv * sizeof(vertexId_t)));
+      d_update_frontier = d_next_frontier;
+      d_next_frontier = temp;
+      
+      CHECK_CUDA(cudaMemcpy(&h_update_count, d_update_count, sizeof(int), cudaMemcpyDeviceToHost));
+}      
+ CHECK_CUDA(cudaMemcpy(h_levels, d_levels, nv * sizeof(int), cudaMemcpyDeviceToHost));
+ 
+ for (int i = 0; i < nv; i++) {
+  printf("Vertex %d: Level %d\n", i, h_levels[i]);
+}  
+  }                       
+
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   CHECK_CUDA(cudaFree(d_update_edges));
   CHECK_CUDA(cudaFree(d_update_frontier));
   CHECK_CUDA(cudaFree(d_update_count));
 }
 
-
-// Printer utility function for cuStinger
 void printcuStingerUtility(cuStinger custing, bool allInfo) {
     length_t used, allocated;
     used = custing.getNumberEdgesUsed();
@@ -459,15 +554,14 @@ void printcuStingerUtility(cuStinger custing, bool allInfo) {
         cout << "," << (float)used / (float)allocated;
 }
 
-// Generate random edge updates
-void generateEdgeUpdates(length_t nv, length_t numEdges, vertexId_t* edgeSrc, vertexId_t* edgeDst) {
+void generateEdgeUpdates(length_t nv, length_t numEdges, vertexId_t* edgeSrc, vertexId_t* edgeDst, int* update_edges) {
     for (int e = 0; e < numEdges; e++) {
-        edgeSrc[e] = rand() % nv;
-        edgeDst[e] = rand() % nv;
+        edgeSrc[e] = update_edges[2*e] % nv;
+        edgeDst[e] = update_edges[2*e+1] % nv;
     }
 }
 
-// RMAT edge generation (helper functions)
+
 typedef struct dxor128_env {
     unsigned x, y, z, w;
 } dxor128_env_t;
@@ -529,7 +623,7 @@ void rmat_edge(int64_t * iout, int64_t * jout, int SCALE, double A, double B, do
     *jout = j;
 }
 
-// Generate RMAT edge updates
+
 void generateEdgeUpdatesRMAT(length_t nv, length_t numEdges, vertexId_t* edgeSrc, vertexId_t* edgeDst,
                              double A, double B, double C, double D, dxor128_env_t * env)
 {
@@ -542,9 +636,11 @@ void generateEdgeUpdatesRMAT(length_t nv, length_t numEdges, vertexId_t* edgeSrc
     }
 }
 
+
+
 int main(const int argc, char *argv[])
 {  
-    //  testBFS();
+    
     int device = 0;
     cudaSetDevice(device);
     cudaDeviceProp prop;
@@ -583,7 +679,7 @@ int main(const int argc, char *argv[])
     }
  
 
-    // Set up for cuStinger
+    
     cudaEvent_t ce_start, ce_stop;
     cuStingerInitConfig cuInit;
     cuInit.initState   = eInitStateCSR;
@@ -600,15 +696,17 @@ int main(const int argc, char *argv[])
     cuInit.csrEW       = NULL;
     cuStinger custing2(defaultInitAllocater, defaultUpdateAllocater);
     custing2.initializeCuStinger(cuInit);
-    // Run BFS on the original CSR arrays
-    cout << "Running BFS on the input graph ...\n";
+
+    
     int* h_levels = (int*)malloc(nv * sizeof(int));
     for (int i = 0; i < nv; i++) {
-        h_levels[i] = -1;  // -1 indicates undiscovered
+        h_levels[i] = -1;  
     }
     h_levels[1] = 0;
     int* d_frontier;
     CHECK_CUDA(cudaMalloc((void**)&d_frontier, nv * sizeof(vertexId_t)));
+
+    cout << "Running BFS on the input graph ...\n";
     auto start = std::chrono::high_resolution_clock::now();
     int * levels = runBFS(&custing2, 1 ,h_levels,d_frontier);
     auto end = std::chrono::high_resolution_clock::now();
@@ -616,38 +714,101 @@ int main(const int argc, char *argv[])
     cout << "Finished BFS.\n\n";
     cout<<"nv: "<<cuInit.csrNV<<" "<<"ne: "<<cuInit.csrNE<<endl;  
 
-    // Calculate the duration
+    
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-    // Convert duration to hours, minutes, seconds, and milliseconds
-    auto hours = std::chrono::duration_cast<std::chrono::hours>(duration);
-    duration -= hours;
-    auto minutes = std::chrono::duration_cast<std::chrono::minutes>(duration);
-    duration -= minutes;
-    auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
-    duration -= seconds;
-    auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-
-    // Display the elapsed time
-    std::cout << "Time taken for BFS: "
-              << hours.count() << " hours, "
-              << minutes.count() << " minutes, "
-              << seconds.count() << " seconds, "
-              << milliseconds.count() << " milliseconds" << std::endl;
+    
+auto hours = std::chrono::duration_cast<std::chrono::hours>(duration);
+duration -= hours;
+auto minutes = std::chrono::duration_cast<std::chrono::minutes>(duration);
+duration -= minutes;
+auto seconds = std::chrono::duration_cast<std::chrono::seconds>(duration);
+duration -= seconds;
+auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(duration);
+duration -= milliseconds;
+auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(duration);
 
 
-    // 
-    ////////////////
-    //TESTING STREAMING BFS
-    ////////////////////
-        // Load updates (additions or deletions)
-        int update_edges[2] = {1, 6};   // Packed as: [source, destination]
-        int num_updates = 1;            // Only one edge update in this batch
-        bool isAddition = true;         // Indicate that this is an edge addition
+std::cout << "Time taken for BFS: "
+          << hours.count() << " hours, "
+          << minutes.count() << " minutes, "
+          << seconds.count() << " seconds, "
+          << milliseconds.count() << " milliseconds, "
+          << microseconds.count() << " microseconds" << std::endl;
+
+        
+        int update_edges[4] = {1, 8, 1, 6};   
+        int num_updates = 2;            
+        bool isAddition = true;         
+
+       
+
+        
+        updateBFSUpdates(&custing2, levels, d_frontier, update_edges,num_updates, isAddition,1);
+printf(" ADDITION DONE\n");
+        
+        
+        
+        int numEdgesToDelete = 2;
+        BatchUpdateData bud(numEdgesToDelete, true, nv);  
+        vertexId_t* src = bud.getSrc();
+        vertexId_t* dst = bud.getDst();
+
+        
+        
+        
+        
 
 
-        updateBFSUpdates(&custing2, levels, d_frontier, update_edges,num_updates, isAddition);
+{
+  int update_edges_fwd[] = {2, 4, 6, 7}; 
+  length_t numEdges = 2;  
+  BatchUpdateData budFwd(numEdges, true);
+  generateEdgeUpdates(nv, numEdges, budFwd.getSrc(), budFwd.getDst(), update_edges_fwd);
+  BatchUpdate buFwd(budFwd);
+  custing2.edgeDeletions(buFwd);
+  
+  custing2.verifyEdgeDeletions(buFwd);
+}
 
+
+{
+  int update_edges_rev[] = { 4,2,7,6 }; 
+  length_t numEdges = 2;  
+  BatchUpdateData budRev(numEdges, true);
+  generateEdgeUpdates(nv, numEdges, budRev.getSrc(), budRev.getDst(), update_edges_rev);
+  BatchUpdate buRev(budRev);
+  custing2.edgeDeletions(buRev);
+  
+  custing2.verifyEdgeDeletions(buRev);
+}
+        int update_edges_del[] = {2, 4, 6, 7}; 
+        int update_edges_batch_del[] = {4,2,7,6}; 
+        printf("Running BFS with edge deletions...\n"); 
+        int* h_levels_del = (int*)malloc(nv * sizeof(int));
+        for (int i = 0; i < nv; i++) {
+            h_levels_del[i] = -1;  
+        }
+        h_levels_del[1] = 0;
+        int* d_frontier_del;
+        CHECK_CUDA(cudaMalloc((void**)&d_frontier_del, nv * sizeof(vertexId_t)));
+        int * levels_del=runBFS(&custing2, 1 ,h_levels_del,d_frontier_del);
+        printf("Running with updateBFSupdates..\n\n");
+
+        updateBFSUpdates(&custing2, levels, d_frontier, update_edges_del ,num_updates, false,1);
+
+        int* h_levels_rev = (int*)malloc(nv * sizeof(int));
+        for (int i = 0; i < nv; i++) {
+            h_levels_rev[i] = -1;  
+        }
+        h_levels_rev[7] = 0;
+        int* d_frontier_rev;
+        CHECK_CUDA(cudaMalloc((void**)&d_frontier_rev, nv * sizeof(vertexId_t)));
+        int * levels_rev=runBFS(&custing2, 7 ,h_levels_rev,d_frontier_rev);
+        custing2.freecuStinger();
+
+    
+    
     free(off);
     free(adj);
     return 0;	
